@@ -29,5 +29,9 @@ RUN apt-get update -y && \
   apt-get clean && \
   rm -rf /var/lib/apt/lists/*
 
-# install PyFlink
-RUN pip3 install apache-flink==${FLINK_VERSION}
+# install PyFlink and dependencies
+RUN pip3 install apache-flink==${FLINK_VERSION} statsmodels>=0.14.0 kafka-python
+
+# Copy application code
+COPY src/ /opt/flink/usrlib/
+RUN chmod +x /opt/flink/usrlib/*.py

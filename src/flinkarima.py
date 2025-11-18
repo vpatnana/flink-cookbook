@@ -32,7 +32,7 @@ from pyflink.common import Row, Types, Time
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors import FlinkKafkaConsumer
-from pyflink.datastream.functions import KeyedProcessFunction, ProcessWindowFunction, KeyedBroadcastProcessFunction
+from pyflink.datastream.functions import KeyedProcessFunction, ProcessWindowFunction, KeyedBroadcastProcessFunction, SourceFunction
 from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor, MapStateDescriptor
 from pyflink.datastream.window import TumblingProcessingTimeWindows
 
@@ -40,6 +40,82 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 LOGGER = logging.getLogger("flinkarima")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+
+
+class MetricGenerator(SourceFunction):
+    """Flink source function that generates node CPU metrics with daily seasonality."""
+    
+    def __init__(self, num_nodes: int = 5, rate: float = 2.0, duration_seconds: int = None):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.rate = rate  # messages per second per node
+        self.duration_seconds = duration_seconds
+        self.running = True
+        
+    def run(self, source_context):
+        import random
+        import time
+        from datetime import datetime
+        
+        nodes = [f"node-{i:02d}" for i in range(1, self.num_nodes + 1)]
+        node_bases = {node: random.uniform(30, 70) for node in nodes}
+        # Interval should be 1.0 / rate since we emit num_nodes messages per iteration
+        # This ensures rate messages per second per node
+        interval = 1.0 / self.rate if self.rate > 0 else 1.0
+        start_time = time.time()
+        message_count = 0
+        
+        LOGGER.info(f"Starting metric generation: {self.num_nodes} nodes, {self.rate} msg/sec/node")
+        
+        while self.running:
+            current_time = time.time()
+            if self.duration_seconds and (current_time - start_time) > self.duration_seconds:
+                break
+            
+            now = datetime.now()
+            hour = now.hour
+            minute = now.minute
+            
+            for node_id in nodes:
+                if not self.running:
+                    break
+                    
+                # Generate CPU with daily seasonality
+                base = node_bases[node_id]
+                if 0 <= hour < 6:
+                    time_factor = 0.4
+                elif 6 <= hour < 9:
+                    time_factor = 0.6
+                elif 9 <= hour < 17:
+                    time_factor = 1.2
+                elif 17 <= hour < 22:
+                    time_factor = 0.8
+                else:
+                    time_factor = 0.5
+                
+                cpu = base * time_factor + random.uniform(-5, 5)
+                if random.random() < 0.01:  # 1% spike probability
+                    cpu += random.uniform(30, 50)
+                cpu = max(0.0, min(100.0, cpu))
+                
+                metric = Row(
+                    node_id=node_id,
+                    cpu=round(cpu, 2),
+                    event_time=int(current_time * 1000)
+                )
+                
+                source_context.collect(metric)
+                message_count += 1
+                
+                if message_count % 100 == 0:
+                    LOGGER.debug(f"Generated {message_count} metrics")
+            
+            time.sleep(interval)
+        
+        LOGGER.info(f"Metric generation complete: {message_count} messages")
+    
+    def cancel(self):
+        self.running = False
 
 
 def parse_metric(raw: str) -> Row:
@@ -318,13 +394,26 @@ def run_job(args):
     env.enable_checkpointing(args.checkpoint_ms)
     env.set_parallelism(args.parallelism)
 
-    source = build_consumer(args.topic, args.bootstrap_servers)
-    metric_stream = env.add_source(source).name("kafka_node_metrics")
-
-    parsed = metric_stream.map(
-        parse_metric,
-        output_type=Types.ROW_NAMED(["node_id", "cpu", "event_time"], [Types.STRING(), Types.FLOAT(), Types.LONG()]),
-    )
+    # Use datagen source if enabled, otherwise use Kafka
+    if args.use_datagen:
+        LOGGER.info("Using built-in datagen source (no Kafka required)")
+        generator = MetricGenerator(
+            num_nodes=args.datagen_nodes,
+            rate=args.datagen_rate,
+            duration_seconds=args.datagen_duration,
+        )
+        parsed = env.add_source(generator, output_type=Types.ROW_NAMED(
+            ["node_id", "cpu", "event_time"],
+            [Types.STRING(), Types.FLOAT(), Types.LONG()]
+        )).name("datagen_metrics")
+    else:
+        LOGGER.info(f"Using Kafka source: {args.topic} @ {args.bootstrap_servers}")
+        source = build_consumer(args.topic, args.bootstrap_servers)
+        metric_stream = env.add_source(source).name("kafka_node_metrics")
+        parsed = metric_stream.map(
+            parse_metric,
+            output_type=Types.ROW_NAMED(["node_id", "cpu", "event_time"], [Types.STRING(), Types.FLOAT(), Types.LONG()]),
+        )
 
     keyed = parsed.key_by(lambda row: row.node_id, key_type=Types.STRING())
 
@@ -400,8 +489,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Compute SARIMAX baselines for node CPU utilization."
     )
-    parser.add_argument("--topic", default="node-metrics")
-    parser.add_argument("--bootstrap-servers", default="redpanda-1:9092")
+    parser.add_argument("--use-datagen", action="store_true", help="Use built-in datagen source instead of Kafka")
+    parser.add_argument("--topic", default="node-metrics", help="Kafka topic (ignored if --use-datagen)")
+    parser.add_argument("--bootstrap-servers", default="redpanda-1:9092", help="Kafka bootstrap servers (ignored if --use-datagen)")
+    parser.add_argument("--datagen-nodes", type=int, default=5, help="Number of nodes for datagen source")
+    parser.add_argument("--datagen-rate", type=float, default=2.0, help="Messages per second per node for datagen")
+    parser.add_argument("--datagen-duration", type=int, default=None, help="Duration in seconds for datagen (None = infinite)")
     parser.add_argument("--parallelism", type=int, default=1)
     parser.add_argument("--checkpoint-ms", type=int, default=60000)
     parser.add_argument("--max-history", type=int, default=1440, help="Number of 5-minute samples to retain (~5 days).")
